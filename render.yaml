@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: antigravity-clinicas-whatsapp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: API_SECRET
+        value: antigravity-secure-wapi-7742
+      - key: PORT
+        value: 7860
