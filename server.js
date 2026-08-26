@@ -332,6 +332,38 @@ app.get('/api/whatsapp/messages', (req, res) => {
     res.json(list);
 });
 
+// Endpoint para Pareamento de WhatsApp via Número de Telefone (Código de 8 dígitos)
+app.post('/api/whatsapp/pair-code', async (req, res) => {
+    try {
+        let { phoneNumber } = req.body;
+        if (!phoneNumber) {
+            return res.status(400).json({ error: 'Número de telefone é obrigatório.' });
+        }
+
+        let clean = phoneNumber.replace(/\D/g, '');
+        if (!clean.startsWith('55') && clean.length <= 11) {
+            clean = '55' + clean;
+        }
+
+        if (!sock) {
+            await connectToWhatsApp();
+        }
+
+        if (sock.authState?.creds?.registered) {
+            return res.status(400).json({ error: 'WhatsApp já está conectado e registrado nesta sessão.' });
+        }
+
+        // Solicita o código de pareamento oficial ao WhatsApp
+        const code = await sock.requestPairingCode(clean);
+        console.log(`Código de pareamento gerado para ${clean}: ${code}`);
+
+        res.json({ success: true, code, phoneNumber: clean });
+    } catch (err) {
+        console.error('Erro ao gerar pairing code:', err);
+        res.status(500).json({ error: 'Erro ao solicitar código de pareamento: ' + err.message });
+    }
+});
+
 // Endpoint para buscar Foto de Perfil do Contato ou Grupo
 app.get('/api/whatsapp/avatar', async (req, res) => {
     const jid = req.query.jid;
