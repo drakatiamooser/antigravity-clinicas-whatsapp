@@ -25,6 +25,10 @@ let currentQrCode = null;
 let connectionStatus = 'disconnected';
 let phoneNumber = null;
 
+// Armazenamento em memória de chats e mensagens
+const chatsMap = new Map();
+const messagesMap = new Map();
+
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
@@ -52,10 +56,59 @@ async function connectToWhatsApp() {
                 fs.rmSync('./auth_info_baileys', { recursive: true, force: true });
             }
         } else if (connection === 'open') {
-            console.log('WhatsApp conectado!');
+            console.log('WhatsApp conectado com sucesso!');
             connectionStatus = 'connected';
             currentQrCode = null;
             phoneNumber = sock.user.id.split(':')[0];
+        }
+    });
+
+    sock.ev.on('messages.upsert', async (m) => {
+        try {
+            const msg = m.messages[0];
+            if (!msg || !msg.message) return;
+
+            const jid = msg.key.remoteJid;
+            if (jid.includes('@g.us')) return; // ignora grupos por enquanto
+
+            const text = msg.message.conversation || 
+                         msg.message.extendedTextMessage?.text || 
+                         msg.message.imageMessage?.caption || 
+                         (msg.message.documentMessage ? '[Documento Anexo]' : '[Mídia]');
+            
+            const fromMe = msg.key.fromMe;
+            const pushName = msg.pushName || jid.split('@')[0];
+            const timestamp = (msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now());
+
+            const messageObj = {
+                id: msg.key.id,
+                text,
+                fromMe,
+                timestamp,
+                status: fromMe ? 'SENT' : 'RECEIVED'
+            };
+
+            // Salva na lista de mensagens do chat
+            if (!messagesMap.has(jid)) {
+                messagesMap.set(jid, []);
+            }
+            const chatMessages = messagesMap.get(jid);
+            chatMessages.push(messageObj);
+            if (chatMessages.length > 100) chatMessages.shift(); // limita a 100 mensagens recentes
+
+            // Atualiza resumo do chat
+            const prevChat = chatsMap.get(jid) || { unreadCount: 0 };
+            chatsMap.set(jid, {
+                id: jid,
+                name: pushName,
+                phoneNumber: jid.split('@')[0],
+                lastMessage: text,
+                timestamp,
+                unreadCount: fromMe ? 0 : (prevChat.unreadCount + 1)
+            });
+
+        } catch (e) {
+            console.error('Erro ao processar mensagem recebida:', e);
         }
     });
 
@@ -71,6 +124,85 @@ app.get('/api/whatsapp/status', (req, res) => {
         qr: currentQrCode,
         number: phoneNumber
     });
+});
+
+app.get('/api/whatsapp/chats', (req, res) => {
+    const list = Array.from(chatsMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+    res.json(list);
+});
+
+app.get('/api/whatsapp/messages', (req, res) => {
+    const jid = req.query.jid;
+    if (!jid) {
+        return res.status(400).json({ error: 'Parâmetro jid é obrigatório.' });
+    }
+    const list = messagesMap.get(jid) || [];
+    
+    // Zera contagem de não lidas ao abrir o chat
+    const chat = chatsMap.get(jid);
+    if (chat) {
+        chat.unreadCount = 0;
+    }
+
+    res.json(list);
+});
+
+app.post('/api/whatsapp/send-message', async (req, res) => {
+    try {
+        const { to, message, documentUrl, documentName } = req.body;
+        if (!to || (!message && !documentUrl)) {
+            return res.status(400).json({ error: 'Destinatário (to) e mensagem/documento são obrigatórios.' });
+        }
+
+        if (!sock || connectionStatus !== 'connected') {
+            return res.status(503).json({ error: 'WhatsApp não está conectado.' });
+        }
+
+        let cleanNumber = to.replace(/\D/g, '');
+        if (!cleanNumber.startsWith('55') && cleanNumber.length <= 11) {
+            cleanNumber = '55' + cleanNumber;
+        }
+        const jid = cleanNumber + '@s.whatsapp.net';
+
+        let sentMsg;
+        if (documentUrl) {
+            sentMsg = await sock.sendMessage(jid, {
+                document: { url: documentUrl },
+                mimetype: 'application/pdf',
+                fileName: documentName || 'Documento-Clinica.pdf',
+                caption: message || ''
+            });
+        } else {
+            sentMsg = await sock.sendMessage(jid, { text: message });
+        }
+
+        // Salva na memória
+        const timestamp = Date.now();
+        const msgObj = {
+            id: sentMsg.key.id,
+            text: message || (documentName ? `📄 ${documentName}` : '[Documento]'),
+            fromMe: true,
+            timestamp,
+            status: 'SENT'
+        };
+
+        if (!messagesMap.has(jid)) messagesMap.set(jid, []);
+        messagesMap.get(jid).push(msgObj);
+
+        chatsMap.set(jid, {
+            id: jid,
+            name: cleanNumber,
+            phoneNumber: cleanNumber,
+            lastMessage: msgObj.text,
+            timestamp,
+            unreadCount: 0
+        });
+
+        res.json({ success: true, messageId: sentMsg.key.id });
+    } catch (err) {
+        console.error('Erro ao enviar mensagem:', err);
+        res.status(500).json({ error: 'Erro ao disparar mensagem no WhatsApp: ' + err.message });
+    }
 });
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
