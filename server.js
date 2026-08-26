@@ -25,9 +25,39 @@ let currentQrCode = null;
 let connectionStatus = 'disconnected';
 let phoneNumber = null;
 
-// Armazenamento em memória de chats e mensagens
-const chatsMap = new Map();
-const messagesMap = new Map();
+// Armazenamento em memória e persistência em disco de chats e mensagens
+const STORE_FILE = './chats_store.json';
+let chatsMap = new Map();
+let messagesMap = new Map();
+const contactsMap = new Map();
+
+// Carrega store do disco se existir
+try {
+    if (fs.existsSync(STORE_FILE)) {
+        const raw = fs.readFileSync(STORE_FILE, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (parsed.chats) {
+            chatsMap = new Map(parsed.chats.map(c => [c.id, c]));
+        }
+        if (parsed.messages) {
+            messagesMap = new Map(Object.entries(parsed.messages));
+        }
+        console.log(`Carregado store do disco: ${chatsMap.size} conversas.`);
+    }
+} catch (e) {
+    console.error('Erro ao ler chats_store.json:', e);
+}
+
+// Salva store no disco
+function saveStoreToDisk() {
+    try {
+        const chats = Array.from(chatsMap.values());
+        const messages = Object.fromEntries(messagesMap.entries());
+        fs.writeFileSync(STORE_FILE, JSON.stringify({ chats, messages }, null, 2));
+    } catch (e) {
+        console.error('Erro ao salvar chats_store.json:', e);
+    }
+}
 
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -35,7 +65,8 @@ async function connectToWhatsApp() {
     sock = makeWASocket({
         auth: state,
         printQRInTerminal: true,
-        logger: pino({ level: 'silent' })
+        logger: pino({ level: 'silent' }),
+        syncFullHistory: true
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -63,6 +94,122 @@ async function connectToWhatsApp() {
         }
     });
 
+    // 1. Sincronização de Contatos da Agenda do Celular
+    sock.ev.on('contacts.upsert', (contacts) => {
+        for (const c of contacts) {
+            if (c.id) {
+                const name = c.name || c.notify || c.verifiedName || null;
+                if (name) contactsMap.set(c.id, name);
+            }
+        }
+    });
+
+    // 2. Sincronização Inicial Completa do Histórico do WhatsApp (messaging-history.set)
+    sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
+        console.log(`[Histórico] Sincronizando: ${chats?.length || 0} conversas e ${messages?.length || 0} mensagens.`);
+
+        if (contacts) {
+            for (const c of contacts) {
+                if (c.id) {
+                    const name = c.name || c.notify || c.verifiedName || null;
+                    if (name) contactsMap.set(c.id, name);
+                }
+            }
+        }
+
+        if (messages) {
+            for (const msg of messages) {
+                const jid = msg.key?.remoteJid;
+                if (!jid || jid === 'status@broadcast' || jid.includes('@g.us')) continue;
+
+                const text = msg.message?.conversation || 
+                             msg.message?.extendedTextMessage?.text || 
+                             msg.message?.imageMessage?.caption ||
+                             (msg.message?.documentMessage ? `📄 ${msg.message.documentMessage.fileName || 'Documento'}` : null) ||
+                             (msg.message?.imageMessage ? '📷 Foto' : null) ||
+                             (msg.message?.audioMessage ? '🎵 Áudio' : null);
+
+                if (!text) continue;
+
+                const fromMe = Boolean(msg.key.fromMe);
+                const pushName = msg.pushName || contactsMap.get(jid) || jid.split('@')[0];
+                const timestamp = (msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now());
+
+                const messageObj = {
+                    id: msg.key.id,
+                    text,
+                    fromMe,
+                    timestamp,
+                    status: fromMe ? 'SENT' : 'RECEIVED'
+                };
+
+                if (!messagesMap.has(jid)) messagesMap.set(jid, []);
+                const chatMessages = messagesMap.get(jid);
+                if (!chatMessages.some(m => m.id === messageObj.id)) {
+                    chatMessages.push(messageObj);
+                }
+
+                // Atualiza resumo da conversa
+                const existing = chatsMap.get(jid);
+                if (!existing || timestamp >= existing.timestamp) {
+                    chatsMap.set(jid, {
+                        id: jid,
+                        name: pushName,
+                        phoneNumber: jid.split('@')[0],
+                        lastMessage: text,
+                        timestamp,
+                        unreadCount: existing ? existing.unreadCount : 0
+                    });
+                }
+            }
+        }
+
+        if (chats) {
+            for (const chat of chats) {
+                const jid = chat.id;
+                if (!jid || jid === 'status@broadcast' || jid.includes('@g.us')) continue;
+
+                if (!chatsMap.has(jid)) {
+                    const name = chat.name || contactsMap.get(jid) || jid.split('@')[0];
+                    const timestamp = chat.conversationTimestamp ? Number(chat.conversationTimestamp) * 1000 : Date.now();
+                    chatsMap.set(jid, {
+                        id: jid,
+                        name,
+                        phoneNumber: jid.split('@')[0],
+                        lastMessage: "Conversa sincronizada",
+                        timestamp,
+                        unreadCount: chat.unreadCount || 0
+                    });
+                }
+            }
+        }
+
+        saveStoreToDisk();
+    });
+
+    // 3. Novas Conversas e Atualizações em Tempo Real (chats.upsert & chats.update)
+    sock.ev.on('chats.upsert', (newChats) => {
+        for (const chat of newChats) {
+            const jid = chat.id;
+            if (!jid || jid === 'status@broadcast' || jid.includes('@g.us')) continue;
+            
+            const prev = chatsMap.get(jid) || {};
+            const name = chat.name || prev.name || contactsMap.get(jid) || jid.split('@')[0];
+            const timestamp = chat.conversationTimestamp ? Number(chat.conversationTimestamp) * 1000 : (prev.timestamp || Date.now());
+
+            chatsMap.set(jid, {
+                id: jid,
+                name,
+                phoneNumber: jid.split('@')[0],
+                lastMessage: prev.lastMessage || "Conversa ativa",
+                timestamp,
+                unreadCount: chat.unreadCount !== undefined ? chat.unreadCount : (prev.unreadCount || 0)
+            });
+        }
+        saveStoreToDisk();
+    });
+
+    // 4. Mensagens Recebidas e Enviadas (messages.upsert)
     sock.ev.on('messages.upsert', async (m) => {
         try {
             const msg = m.messages[0];
@@ -93,7 +240,7 @@ async function connectToWhatsApp() {
             if (!text || text.trim() === '') return;
             
             const fromMe = Boolean(msg.key.fromMe);
-            const pushName = msg.pushName || jid.split('@')[0];
+            const pushName = msg.pushName || contactsMap.get(jid) || jid.split('@')[0];
             const timestamp = (msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now());
 
             const messageObj = {
@@ -126,6 +273,8 @@ async function connectToWhatsApp() {
                 timestamp,
                 unreadCount: fromMe ? 0 : (prevChat.unreadCount + 1)
             });
+
+            saveStoreToDisk();
 
         } catch (e) {
             console.error('Erro ao processar mensagem recebida:', e);
