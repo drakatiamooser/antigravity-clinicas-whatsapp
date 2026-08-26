@@ -312,7 +312,20 @@ app.get('/api/whatsapp/status', (req, res) => {
 });
 
 app.get('/api/whatsapp/chats', (req, res) => {
-    const list = Array.from(chatsMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+    const list = Array.from(chatsMap.values()).map(chat => {
+        const contactName = contactsMap.get(chat.id);
+        let name = chat.name;
+
+        // Se o nome atual for apenas o número ou genérico, tenta o pushName salvo
+        if (!name || /^\d+$/.test(name) || name === chat.phoneNumber) {
+            name = contactName || name || chat.phoneNumber;
+        }
+
+        return {
+            ...chat,
+            name
+        };
+    }).sort((a, b) => b.timestamp - a.timestamp);
     res.json(list);
 });
 
