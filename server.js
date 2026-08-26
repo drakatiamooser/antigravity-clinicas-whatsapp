@@ -30,6 +30,16 @@ const STORE_FILE = './chats_store.json';
 let chatsMap = new Map();
 let messagesMap = new Map();
 const contactsMap = new Map();
+const profilePicsMap = new Map();
+const groupsMetadataMap = new Map();
+
+// Determina tipo de chat pelo JID
+function getChatType(jid) {
+    if (!jid) return 'user';
+    if (jid.endsWith('@g.us')) return 'group';
+    if (jid.endsWith('@newsletter')) return 'channel';
+    return 'user';
+}
 
 // Carrega store do disco se existir
 try {
@@ -105,7 +115,7 @@ async function connectToWhatsApp() {
     });
 
     // 2. Sincronização Inicial Completa do Histórico do WhatsApp (messaging-history.set)
-    sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
+    sock.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
         console.log(`[Histórico] Sincronizando: ${chats?.length || 0} conversas e ${messages?.length || 0} mensagens.`);
 
         if (contacts) {
@@ -120,7 +130,7 @@ async function connectToWhatsApp() {
         if (messages) {
             for (const msg of messages) {
                 const jid = msg.key?.remoteJid;
-                if (!jid || jid === 'status@broadcast' || jid.includes('@g.us')) continue;
+                if (!jid || jid === 'status@broadcast') continue;
 
                 const text = msg.message?.conversation || 
                              msg.message?.extendedTextMessage?.text || 
@@ -132,7 +142,8 @@ async function connectToWhatsApp() {
                 if (!text) continue;
 
                 const fromMe = Boolean(msg.key.fromMe);
-                const pushName = msg.pushName || contactsMap.get(jid) || jid.split('@')[0];
+                const type = getChatType(jid);
+                const pushName = msg.pushName || contactsMap.get(jid) || (type === 'group' ? 'Grupo WhatsApp' : jid.split('@')[0]);
                 const timestamp = (msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now());
 
                 const messageObj = {
@@ -156,6 +167,7 @@ async function connectToWhatsApp() {
                         id: jid,
                         name: pushName,
                         phoneNumber: jid.split('@')[0],
+                        type,
                         lastMessage: text,
                         timestamp,
                         unreadCount: existing ? existing.unreadCount : 0
@@ -167,15 +179,17 @@ async function connectToWhatsApp() {
         if (chats) {
             for (const chat of chats) {
                 const jid = chat.id;
-                if (!jid || jid === 'status@broadcast' || jid.includes('@g.us')) continue;
+                if (!jid || jid === 'status@broadcast') continue;
 
+                const type = getChatType(jid);
                 if (!chatsMap.has(jid)) {
-                    const name = chat.name || contactsMap.get(jid) || jid.split('@')[0];
+                    const name = chat.name || contactsMap.get(jid) || (type === 'group' ? 'Grupo WhatsApp' : (type === 'channel' ? 'Canal' : jid.split('@')[0]));
                     const timestamp = chat.conversationTimestamp ? Number(chat.conversationTimestamp) * 1000 : Date.now();
                     chatsMap.set(jid, {
                         id: jid,
                         name,
                         phoneNumber: jid.split('@')[0],
+                        type,
                         lastMessage: "Conversa sincronizada",
                         timestamp,
                         unreadCount: chat.unreadCount || 0
@@ -191,16 +205,18 @@ async function connectToWhatsApp() {
     sock.ev.on('chats.upsert', (newChats) => {
         for (const chat of newChats) {
             const jid = chat.id;
-            if (!jid || jid === 'status@broadcast' || jid.includes('@g.us')) continue;
+            if (!jid || jid === 'status@broadcast') continue;
             
+            const type = getChatType(jid);
             const prev = chatsMap.get(jid) || {};
-            const name = chat.name || prev.name || contactsMap.get(jid) || jid.split('@')[0];
+            const name = chat.name || prev.name || contactsMap.get(jid) || (type === 'group' ? 'Grupo' : jid.split('@')[0]);
             const timestamp = chat.conversationTimestamp ? Number(chat.conversationTimestamp) * 1000 : (prev.timestamp || Date.now());
 
             chatsMap.set(jid, {
                 id: jid,
                 name,
                 phoneNumber: jid.split('@')[0],
+                type,
                 lastMessage: prev.lastMessage || "Conversa ativa",
                 timestamp,
                 unreadCount: chat.unreadCount !== undefined ? chat.unreadCount : (prev.unreadCount || 0)
@@ -216,9 +232,8 @@ async function connectToWhatsApp() {
             if (!msg || !msg.message) return;
 
             const jid = msg.key.remoteJid;
-            if (!jid || jid === 'status@broadcast' || jid.includes('@g.us')) return;
+            if (!jid || jid === 'status@broadcast') return;
 
-            // Ignora pacotes de protocolo / sincronização interna do Baileys
             if (
                 msg.message.protocolMessage || 
                 msg.message.senderKeyDistributionMessage ||
@@ -240,7 +255,8 @@ async function connectToWhatsApp() {
             if (!text || text.trim() === '') return;
             
             const fromMe = Boolean(msg.key.fromMe);
-            const pushName = msg.pushName || contactsMap.get(jid) || jid.split('@')[0];
+            const type = getChatType(jid);
+            const pushName = msg.pushName || contactsMap.get(jid) || (type === 'group' ? 'Grupo' : jid.split('@')[0]);
             const timestamp = (msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now());
 
             const messageObj = {
@@ -257,7 +273,6 @@ async function connectToWhatsApp() {
             }
             const chatMessages = messagesMap.get(jid);
             
-            // Evita duplicatas pelo ID da mensagem
             if (!chatMessages.some(existing => existing.id === msg.key.id)) {
                 chatMessages.push(messageObj);
                 if (chatMessages.length > 100) chatMessages.shift();
@@ -269,6 +284,7 @@ async function connectToWhatsApp() {
                 id: jid,
                 name: pushName,
                 phoneNumber: jid.split('@')[0],
+                type,
                 lastMessage: text,
                 timestamp,
                 unreadCount: fromMe ? 0 : (prevChat.unreadCount + 1)
@@ -316,6 +332,26 @@ app.get('/api/whatsapp/messages', (req, res) => {
     res.json(list);
 });
 
+// Endpoint para buscar Foto de Perfil do Contato ou Grupo
+app.get('/api/whatsapp/avatar', async (req, res) => {
+    const jid = req.query.jid;
+    if (!jid) return res.status(400).json({ error: 'JID obrigatório' });
+
+    if (profilePicsMap.has(jid)) {
+        return res.json({ url: profilePicsMap.get(jid) });
+    }
+
+    try {
+        if (sock && connectionStatus === 'connected') {
+            const url = await sock.profilePictureUrl(jid, 'preview').catch(() => null);
+            profilePicsMap.set(jid, url || null);
+            return res.json({ url: url || null });
+        }
+    } catch (e) {}
+
+    res.json({ url: null });
+});
+
 app.post('/api/whatsapp/send-message', async (req, res) => {
     try {
         const { to, message, documentUrl, documentName } = req.body;
@@ -328,10 +364,13 @@ app.post('/api/whatsapp/send-message', async (req, res) => {
         }
 
         let cleanNumber = to.replace(/\D/g, '');
-        if (!cleanNumber.startsWith('55') && cleanNumber.length <= 11) {
-            cleanNumber = '55' + cleanNumber;
+        let jid = to;
+        if (!to.includes('@')) {
+            if (!cleanNumber.startsWith('55') && cleanNumber.length <= 11) {
+                cleanNumber = '55' + cleanNumber;
+            }
+            jid = cleanNumber + '@s.whatsapp.net';
         }
-        const jid = cleanNumber + '@s.whatsapp.net';
 
         let sentMsg;
         if (documentUrl) {
@@ -362,10 +401,13 @@ app.post('/api/whatsapp/send-message', async (req, res) => {
             id: jid,
             name: cleanNumber,
             phoneNumber: cleanNumber,
+            type: getChatType(jid),
             lastMessage: msgObj.text,
             timestamp,
             unreadCount: 0
         });
+
+        saveStoreToDisk();
 
         res.json({ success: true, messageId: sentMsg.key.id });
     } catch (err) {
