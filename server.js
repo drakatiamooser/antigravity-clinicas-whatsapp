@@ -69,14 +69,30 @@ async function connectToWhatsApp() {
             if (!msg || !msg.message) return;
 
             const jid = msg.key.remoteJid;
-            if (jid.includes('@g.us')) return; // ignora grupos por enquanto
+            if (!jid || jid === 'status@broadcast' || jid.includes('@g.us')) return;
 
-            const text = msg.message.conversation || 
-                         msg.message.extendedTextMessage?.text || 
-                         msg.message.imageMessage?.caption || 
-                         (msg.message.documentMessage ? '[Documento Anexo]' : '[Mídia]');
+            // Ignora pacotes de protocolo / sincronização interna do Baileys
+            if (
+                msg.message.protocolMessage || 
+                msg.message.senderKeyDistributionMessage ||
+                msg.message.reactionMessage ||
+                msg.message.pollUpdateMessage ||
+                msg.message.keepAliveMessage
+            ) {
+                return;
+            }
+
+            let text = msg.message.conversation || 
+                       msg.message.extendedTextMessage?.text || 
+                       msg.message.imageMessage?.caption ||
+                       (msg.message.documentMessage ? `📄 ${msg.message.documentMessage.fileName || 'Documento'}` : null) ||
+                       (msg.message.imageMessage ? '📷 Foto' : null) ||
+                       (msg.message.audioMessage ? '🎵 Áudio' : null) ||
+                       (msg.message.videoMessage ? '🎥 Vídeo' : null);
+
+            if (!text || text.trim() === '') return;
             
-            const fromMe = msg.key.fromMe;
+            const fromMe = Boolean(msg.key.fromMe);
             const pushName = msg.pushName || jid.split('@')[0];
             const timestamp = (msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now());
 
@@ -93,8 +109,12 @@ async function connectToWhatsApp() {
                 messagesMap.set(jid, []);
             }
             const chatMessages = messagesMap.get(jid);
-            chatMessages.push(messageObj);
-            if (chatMessages.length > 100) chatMessages.shift(); // limita a 100 mensagens recentes
+            
+            // Evita duplicatas pelo ID da mensagem
+            if (!chatMessages.some(existing => existing.id === msg.key.id)) {
+                chatMessages.push(messageObj);
+                if (chatMessages.length > 100) chatMessages.shift();
+            }
 
             // Atualiza resumo do chat
             const prevChat = chatsMap.get(jid) || { unreadCount: 0 };
