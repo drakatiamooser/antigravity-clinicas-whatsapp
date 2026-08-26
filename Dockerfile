@@ -1,7 +1,7 @@
-FROM node:18-alpine
+FROM node:20-slim
 
-# Instala dependências necessárias para bibliotecas criptográficas do Baileys
-RUN apk add --no-cache git tzdata
+# Instala ferramentas básicas
+RUN apt-get update && apt-get install -y git tzdata && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
