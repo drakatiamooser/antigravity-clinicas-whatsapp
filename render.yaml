@@ -1,10 +1,11 @@
 services:
   - type: web
-    name: antigravity-clinicas-whatsapp
-    runtime: docker
-    dockerfilePath: ./Dockerfile
+    name: katia-mooser-whatsapp
+    runtime: node
     plan: free
     region: oregon
+    buildCommand: npm install
+    startCommand: node server.js
     envVars:
       - key: API_SECRET
         value: antigravity-secure-wapi-7742
