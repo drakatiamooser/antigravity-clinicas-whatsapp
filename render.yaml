@@ -11,3 +11,9 @@ services:
         value: antigravity-secure-wapi-7742
       - key: PORT
         value: 7860
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: TENANT_ID
+        value: 00000000-0000-0000-0000-000000000001
