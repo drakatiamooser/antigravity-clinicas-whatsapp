@@ -809,6 +809,45 @@ app.get('/api/whatsapp/status', (req, res) => {
     });
 });
 
+// Endpoint de lista de chats (compatibilidade e fallback)
+app.get('/api/whatsapp/chats', async (req, res) => {
+    try {
+        if (supabase && SUPABASE_KEY) {
+            const { data, error } = await supabase
+                .from('whatsapp_chats')
+                .select('*')
+                .eq('tenant_id', TENANT_ID)
+                .order('last_message_ts', { ascending: false })
+                .limit(50);
+            if (!error && data && data.length > 0) {
+                const list = data.map(c => ({
+                    id: c.chat_jid,
+                    name: c.name || c.phone_number,
+                    phoneNumber: c.phone_number,
+                    type: c.chat_type,
+                    lastMessage: c.last_message_text || 'Conversa sincronizada',
+                    timestamp: Number(c.last_message_ts),
+                    unreadCount: c.unread_count || 0
+                }));
+                return res.json(list);
+            }
+        }
+    } catch (e) {}
+
+    // Fallback do arquivo local chats_store.json
+    try {
+        const storePath = path.join(__dirname, 'chats_store.json');
+        if (fs.existsSync(storePath)) {
+            const raw = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+            if (raw.chats && raw.chats.length > 0) {
+                return res.json(raw.chats);
+            }
+        }
+    } catch (e) {}
+
+    res.json([]);
+});
+
 // Busca sob demanda no aparelho celular (fetchMessageHistory)
 app.post('/api/whatsapp/fetch-older-history', async (req, res) => {
     try {
