@@ -249,7 +249,11 @@ class BatchFlusher {
     queueChat(chat) {
         if (!chat || !chat.chat_jid) return;
         const prev = this.chatsMap.get(chat.chat_jid) || {};
-        this.chatsMap.set(chat.chat_jid, { ...prev, ...chat });
+        let finalName = chat.name;
+        if (isInvalidName(finalName, chat.phone_number)) {
+            finalName = prev.name && !isInvalidName(prev.name, chat.phone_number) ? prev.name : null;
+        }
+        this.chatsMap.set(chat.chat_jid, { ...prev, ...chat, name: finalName });
     }
 
     queueLidMapping(lid, pn, phone) {
@@ -498,7 +502,10 @@ async function processMessage(msg) {
     }
 
     const contactName = contactsMap.get(canonicalJid) || contactsMap.get(rawJid);
-    let resolvedName = contactName || msg.pushName || (type === 'group' ? 'Grupo' : phone);
+    let resolvedName = contactName || msg.pushName || null;
+    if (isInvalidName(resolvedName, phone)) {
+        resolvedName = type === 'group' ? 'Grupo' : null;
+    }
 
     const timestamp = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
 
@@ -719,7 +726,10 @@ async function connectToWhatsApp() {
                 const type = getChatType(canJid);
                 const phone = canJid.split('@')[0];
                 const contactName = contactsMap.get(canJid);
-                const name = c.name || contactName || (type === 'group' ? 'Grupo' : phone);
+                let name = c.name || contactName || null;
+                if (isInvalidName(name, phone)) {
+                    name = type === 'group' ? 'Grupo' : null;
+                }
 
                 batchFlusher.queueChat({
                     tenant_id: TENANT_ID,
