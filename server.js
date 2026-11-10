@@ -1120,12 +1120,37 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
     }
 });
 
-app.post('/api/whatsapp/connect', (req, res) => {
-    if (!sock) {
-        connectToWhatsApp();
-        res.json({ success: true, message: 'Iniciando conexão.' });
-    } else {
-        res.json({ success: true, message: 'Conexão já em andamento.' });
+app.post('/api/whatsapp/connect', async (req, res) => {
+    try {
+        if (connectionStatus === 'connected') {
+            return res.json({ 
+                success: true, 
+                message: 'WhatsApp já está conectado.', 
+                status: 'connected', 
+                number: phoneNumber 
+            });
+        }
+        
+        if (currentQrCode && connectionStatus === 'qrcode') {
+            return res.json({ 
+                success: true, 
+                message: 'QR Code ativo pronto para leitura.', 
+                status: 'qrcode', 
+                qr: currentQrCode 
+            });
+        }
+
+        if (sock) {
+            try { sock.end(); } catch (e) {}
+            sock = null;
+        }
+        currentQrCode = null;
+        connectionStatus = 'connecting';
+        await connectToWhatsApp();
+        res.json({ success: true, message: 'Novo socket Baileys inicializado.' });
+    } catch (err) {
+        console.error('[Connect API Error]:', err);
+        res.status(500).json({ error: err.message });
     }
 });
 
