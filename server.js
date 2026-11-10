@@ -146,12 +146,15 @@ async function useSupabaseAuthState(sb, tenantId) {
         authCache.set(keyId, data);
         const serialized = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
         try {
-            await sb.from('whatsapp_auth_keys').upsert({
+            const { error } = await sb.from('whatsapp_auth_keys').upsert({
                 tenant_id: tenantId,
                 key_id: keyId,
                 key_data: serialized,
                 updated_at: new Date().toISOString()
             }, { onConflict: 'tenant_id,key_id' });
+            if (error) {
+                console.error(`[Supabase Auth] Erro ao gravar key ${keyId}:`, error.message);
+            }
         } catch (e) {
             console.error(`[Supabase Auth] Erro ao gravar key ${keyId}:`, e.message);
         }
@@ -160,7 +163,10 @@ async function useSupabaseAuthState(sb, tenantId) {
     const removeData = async (keyId) => {
         authCache.delete(keyId);
         try {
-            await sb.from('whatsapp_auth_keys').delete().eq('tenant_id', tenantId).eq('key_id', keyId);
+            const { error } = await sb.from('whatsapp_auth_keys').delete().eq('tenant_id', tenantId).eq('key_id', keyId);
+            if (error) {
+                console.error(`[Supabase Auth] Erro ao remover key ${keyId}:`, error.message);
+            }
         } catch (e) {
             console.error(`[Supabase Auth] Erro ao remover key ${keyId}:`, e.message);
         }
@@ -894,7 +900,15 @@ app.get('/api/whatsapp/status', (req, res) => {
     res.json({
         status: connectionStatus,
         qr: currentQrCode,
-        number: phoneNumber
+        number: phoneNumber,
+        diagnostics: {
+            hasServiceRoleKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+            hasAnonKey: Boolean(process.env.SUPABASE_ANON_KEY),
+            hasSupabaseUrl: Boolean(process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL),
+            supabaseKeyLength: SUPABASE_KEY ? SUPABASE_KEY.length : 0,
+            tenantId: TENANT_ID,
+            authCacheSize: supabaseAuthState ? 'active' : 'inactive'
+        }
     });
 });
 
