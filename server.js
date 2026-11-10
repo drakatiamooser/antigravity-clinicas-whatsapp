@@ -35,6 +35,13 @@ app.use('/api', (req, res, next) => {
     next();
 });
 
+let wsClient = null;
+try {
+    wsClient = require('ws');
+} catch (e) {
+    console.warn("⚠️ [Aviso]: Módulo 'ws' não encontrado:", e.message);
+}
+
 // Configurações do Supabase
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "https://qjevnawugjtzsvgdndll.supabase.co";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "";
@@ -44,9 +51,14 @@ if (!SUPABASE_KEY) {
     console.warn("⚠️ [Aviso]: SUPABASE_SERVICE_ROLE_KEY não configurada. A persistência remota pode falhar.");
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+const supabaseOptions = {
     auth: { persistSession: false }
-});
+};
+if (wsClient) {
+    supabaseOptions.realtime = { transport: wsClient };
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, supabaseOptions);
 
 let sock = null;
 let currentQrCode = null;

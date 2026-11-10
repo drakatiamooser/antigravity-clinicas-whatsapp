@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Instala ferramentas básicas
 RUN apt-get update && apt-get install -y git tzdata && rm -rf /var/lib/apt/lists/*
