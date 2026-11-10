@@ -57,6 +57,7 @@ let supabaseAuthState = null;
 const profilePicsMap = new Map();
 const groupsMetadataMap = new Map();
 const contactsMap = new Map();
+const pushNamesMap = new Map();
 const lidToPnMap = new Map();
 
 // === 1. USE SUPABASE AUTH STATE (Substitui useMultiFileAuthState) ===
@@ -249,11 +250,23 @@ class BatchFlusher {
     queueChat(chat) {
         if (!chat || !chat.chat_jid) return;
         const prev = this.chatsMap.get(chat.chat_jid) || {};
-        let finalName = chat.name;
+        let finalName = chat.name || prev.name || null;
         if (isInvalidName(finalName, chat.phone_number)) {
             finalName = prev.name && !isInvalidName(prev.name, chat.phone_number) ? prev.name : null;
         }
-        this.chatsMap.set(chat.chat_jid, { ...prev, ...chat, name: finalName });
+        let finalPushName = chat.push_name || prev.push_name || null;
+        let finalPhone = chat.phone_number !== undefined ? chat.phone_number : (prev.phone_number || null);
+        // Se o chat for marcado como @lid ou não for @s.whatsapp.net, o phone_number não pode conter hash de LID
+        if (finalPhone && (chat.chat_jid.endsWith('@lid') || (!chat.chat_jid.endsWith('@s.whatsapp.net') && !chat.chat_jid.endsWith('@g.us')))) {
+            finalPhone = null;
+        }
+        this.chatsMap.set(chat.chat_jid, { 
+            ...prev, 
+            ...chat, 
+            name: finalName,
+            push_name: finalPushName,
+            phone_number: finalPhone
+        });
     }
 
     queueLidMapping(lid, pn, phone) {
@@ -345,17 +358,54 @@ function registerLidMapping(lid, pn) {
     batchFlusher.queueLidMapping(cleanLid, cleanPn, rawNumber);
 }
 
-function resolveCanonicalJid(key) {
-    if (!key) return null;
-    const jid = key.remoteJid ? key.remoteJid.replace(/:.*@/, '@') : null;
-    const alt = key.remoteJidAlt ? key.remoteJidAlt.replace(/:.*@/, '@') : null;
+async function resolveCanonicalJidAsync(keyOrJid, alt = null) {
+    if (!keyOrJid) return null;
+    let jid = typeof keyOrJid === 'string' ? keyOrJid : keyOrJid.remoteJid;
+    let altJid = alt || (typeof keyOrJid === 'object' ? keyOrJid.remoteJidAlt : null);
 
-    if (jid?.endsWith('@lid') && alt?.endsWith('@s.whatsapp.net')) {
-        registerLidMapping(jid, alt);
-        return alt;
+    if (jid) jid = jid.replace(/:.*@/, '@');
+    if (altJid) altJid = altJid.replace(/:.*@/, '@');
+
+    if (jid?.endsWith('@lid') && altJid?.endsWith('@s.whatsapp.net')) {
+        registerLidMapping(jid, altJid);
+        return altJid;
     }
-    if (jid?.endsWith('@s.whatsapp.net') && alt?.endsWith('@lid')) {
-        registerLidMapping(alt, jid);
+    if (jid?.endsWith('@s.whatsapp.net') && altJid?.endsWith('@lid')) {
+        registerLidMapping(altJid, jid);
+        return jid;
+    }
+    if (jid?.endsWith('@lid')) {
+        if (lidToPnMap.has(jid)) {
+            return lidToPnMap.get(jid);
+        }
+        if (sock?.signalRepository?.lidMapping?.getPNForLID) {
+            try {
+                const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
+                if (pn) {
+                    const fullPn = pn.endsWith('@s.whatsapp.net') ? pn : `${pn}@s.whatsapp.net`;
+                    registerLidMapping(jid, fullPn);
+                    return fullPn;
+                }
+            } catch (e) {}
+        }
+    }
+    return jid;
+}
+
+function resolveCanonicalJid(keyOrJid, alt = null) {
+    if (!keyOrJid) return null;
+    let jid = typeof keyOrJid === 'string' ? keyOrJid : keyOrJid.remoteJid;
+    let altJid = alt || (typeof keyOrJid === 'object' ? keyOrJid.remoteJidAlt : null);
+
+    if (jid) jid = jid.replace(/:.*@/, '@');
+    if (altJid) altJid = altJid.replace(/:.*@/, '@');
+
+    if (jid?.endsWith('@lid') && altJid?.endsWith('@s.whatsapp.net')) {
+        registerLidMapping(jid, altJid);
+        return altJid;
+    }
+    if (jid?.endsWith('@s.whatsapp.net') && altJid?.endsWith('@lid')) {
+        registerLidMapping(altJid, jid);
         return jid;
     }
     if (jid?.endsWith('@lid') && lidToPnMap.has(jid)) {
@@ -488,21 +538,23 @@ async function processMessage(msg) {
         return;
     }
 
-    const canonicalJid = resolveCanonicalJid(msg.key);
+    const canonicalJid = await resolveCanonicalJidAsync(msg.key);
     const text = extractMessageContent(msg);
     if (!text || text.trim() === '') return;
 
     const fromMe = Boolean(msg.key.fromMe);
     const type = getChatType(canonicalJid);
-    const phone = canonicalJid.split('@')[0];
+    const isLid = canonicalJid.endsWith('@lid');
+    const phone = isLid ? null : canonicalJid.split('@')[0];
 
     if (msg.pushName && !fromMe) {
-        contactsMap.set(canonicalJid, msg.pushName);
-        if (rawJid !== canonicalJid) contactsMap.set(rawJid, msg.pushName);
+        pushNamesMap.set(canonicalJid, msg.pushName);
+        if (rawJid !== canonicalJid) pushNamesMap.set(rawJid, msg.pushName);
     }
 
-    const contactName = contactsMap.get(canonicalJid) || contactsMap.get(rawJid);
-    let resolvedName = contactName || msg.pushName || null;
+    const agendaName = contactsMap.get(canonicalJid) || contactsMap.get(rawJid) || null;
+    const pushName = pushNamesMap.get(canonicalJid) || pushNamesMap.get(rawJid) || msg.pushName || null;
+    let resolvedName = agendaName || null;
     if (isInvalidName(resolvedName, phone)) {
         resolvedName = type === 'group' ? 'Grupo' : null;
     }
@@ -556,8 +608,9 @@ async function processMessage(msg) {
     batchFlusher.queueChat({
         tenant_id: TENANT_ID,
         chat_jid: canonicalJid,
-        lid_jid: rawJid.endsWith('@lid') ? rawJid : null,
+        lid_jid: isLid ? canonicalJid : (rawJid.endsWith('@lid') ? rawJid : null),
         name: resolvedName,
+        push_name: pushName,
         phone_number: phone,
         chat_type: type,
         last_message_text: text,
@@ -688,12 +741,28 @@ async function connectToWhatsApp() {
     // Sincronização de Contatos
     const handleContact = (c) => {
         if (!c || !c.id) return;
-        const name = c.name || c.notify || c.verifiedName || null;
-        if (name) {
-            const cleanId = c.id.replace(/:.*@/, '@');
-            contactsMap.set(cleanId, name);
+        const cleanId = c.id.replace(/:.*@/, '@');
+        
+        // Mapeamento nativo LID se fornecido no contato
+        if (c.lid) {
+            registerLidMapping(c.lid, cleanId);
+        }
+
+        // Nome da agenda do celular
+        if (c.name) {
+            contactsMap.set(cleanId, c.name);
             const phone = cleanId.split('@')[0];
-            if (phone) contactsMap.set(phone, name);
+            if (phone) contactsMap.set(phone, c.name);
+            if (c.lid) contactsMap.set(c.lid.replace(/:.*@/, '@'), c.name);
+        }
+
+        // PushName público do WhatsApp
+        const pushName = c.notify || c.verifiedName || null;
+        if (pushName) {
+            pushNamesMap.set(cleanId, pushName);
+            const phone = cleanId.split('@')[0];
+            if (phone) pushNamesMap.set(phone, pushName);
+            if (c.lid) pushNamesMap.set(c.lid.replace(/:.*@/, '@'), pushName);
         }
     };
 
@@ -706,35 +775,55 @@ async function connectToWhatsApp() {
 
     // Sincronização Inicial Completa (messaging-history.set)
     sock.ev.on('messaging-history.set', async (payload) => {
-        const { contacts, messages, chats } = payload;
-        console.log(`[messaging-history.set] Recebidos: ${contacts?.length || 0} contatos, ${chats?.length || 0} chats, ${messages?.length || 0} msgs.`);
+        const { contacts, messages, chats, lidPnMappings } = payload;
+        console.log(`[messaging-history.set] Recebidos: ${contacts?.length || 0} contatos, ${chats?.length || 0} chats, ${messages?.length || 0} msgs, ${lidPnMappings?.length || 0} lidMappings.`);
 
+        // 1. Processar mapeamentos LID <-> PN enviados na sincronização do histórico
+        if (lidPnMappings && Array.isArray(lidPnMappings)) {
+            for (const item of lidPnMappings) {
+                if (item.lid && item.pn) {
+                    registerLidMapping(item.lid, item.pn);
+                }
+            }
+        }
+
+        // 2. Processar Contatos e Nomes
         if (contacts && Array.isArray(contacts)) {
             contacts.forEach(handleContact);
         }
 
+        // 3. Processar Mensagens
         if (messages && Array.isArray(messages)) {
             for (const msg of messages) {
                 await processMessage(msg);
             }
         }
 
+        // 4. Processar Lista de Conversas (Chats)
         if (chats && Array.isArray(chats)) {
             for (const c of chats) {
                 if (!c.id || c.id === 'status@broadcast') continue;
-                const canJid = resolveCanonicalJid({ remoteJid: c.id });
+                const rawJid = c.id.replace(/:.*@/, '@');
+                const canJid = await resolveCanonicalJidAsync(rawJid, c.lidJid || c.accountLid || null);
                 const type = getChatType(canJid);
-                const phone = canJid.split('@')[0];
-                const contactName = contactsMap.get(canJid);
-                let name = c.name || contactName || null;
+                
+                const isLid = canJid.endsWith('@lid');
+                const phone = isLid ? null : canJid.split('@')[0];
+                
+                const agendaName = contactsMap.get(canJid) || contactsMap.get(rawJid) || c.name || null;
+                const pushName = pushNamesMap.get(canJid) || pushNamesMap.get(rawJid) || null;
+                
+                let name = agendaName;
                 if (isInvalidName(name, phone)) {
-                    name = type === 'group' ? 'Grupo' : null;
+                    name = type === 'group' ? (c.name || 'Grupo') : null;
                 }
 
                 batchFlusher.queueChat({
                     tenant_id: TENANT_ID,
                     chat_jid: canJid,
+                    lid_jid: isLid ? canJid : (rawJid.endsWith('@lid') ? rawJid : null),
                     name,
+                    push_name: pushName,
                     phone_number: phone,
                     chat_type: type,
                     last_message_ts: c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : Date.now(),
@@ -822,8 +911,9 @@ app.get('/api/whatsapp/chats', async (req, res) => {
             if (!error && data && data.length > 0) {
                 const list = data.map(c => ({
                     id: c.chat_jid,
-                    name: c.name || c.phone_number,
-                    phoneNumber: c.phone_number,
+                    name: c.name || null,
+                    pushName: c.push_name || null,
+                    phoneNumber: c.phone_number || (c.chat_jid.endsWith('@s.whatsapp.net') ? c.chat_jid.split('@')[0] : null),
                     type: c.chat_type,
                     lastMessage: c.last_message_text || 'Conversa sincronizada',
                     timestamp: Number(c.last_message_ts),
@@ -833,6 +923,25 @@ app.get('/api/whatsapp/chats', async (req, res) => {
             }
         }
     } catch (e) {}
+
+    // Fallback de memória ativa do processo Baileys
+    if (batchFlusher?.chatsMap?.size > 0) {
+        const memoryChats = Array.from(batchFlusher.chatsMap.values())
+            .filter(c => c.chat_jid && c.chat_jid !== 'status@broadcast')
+            .sort((a, b) => (Number(b.last_message_ts) || 0) - (Number(a.last_message_ts) || 0))
+            .slice(0, 100)
+            .map(c => ({
+                id: c.chat_jid,
+                name: c.name || null,
+                pushName: c.push_name || null,
+                phoneNumber: c.phone_number || (c.chat_jid.endsWith('@s.whatsapp.net') ? c.chat_jid.split('@')[0] : null),
+                type: c.chat_type || 'user',
+                lastMessage: c.last_message_text || 'Conversa sincronizada',
+                timestamp: Number(c.last_message_ts) || Date.now(),
+                unreadCount: c.unread_count || 0
+            }));
+        if (memoryChats.length > 0) return res.json(memoryChats);
+    }
 
     // Fallback do arquivo local chats_store.json
     try {
