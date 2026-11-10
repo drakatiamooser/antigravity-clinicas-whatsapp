@@ -14,7 +14,8 @@ const {
     downloadMediaMessage,
     BufferJSON,
     initAuthCreds,
-    proto
+    proto,
+    fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const pino = require('pino');
@@ -117,42 +118,10 @@ async function useSupabaseAuthState(sb, tenantId) {
         console.error('[Supabase Auth] Exceção ao carregar auth keys:', err);
     }
 
-    // Auto-migração transparente: se o banco estiver vazio, importa do disco local (auth_info_baileys)
-    const localAuthDir = path.join(__dirname, 'auth_info_baileys');
-    if (authCache.size === 0 && fs.existsSync(localAuthDir)) {
-        try {
-            const files = fs.readdirSync(localAuthDir);
-            const migrationRows = [];
-            for (const file of files) {
-                if (file.endsWith('.json')) {
-                    const keyId = file.replace('.json', '');
-                    const content = fs.readFileSync(path.join(localAuthDir, file), 'utf-8');
-                    try {
-                        const parsed = JSON.parse(content, BufferJSON.reviver);
-                        authCache.set(keyId, parsed);
-                        migrationRows.push({
-                            tenant_id: tenantId,
-                            key_id: keyId,
-                            key_data: JSON.parse(JSON.stringify(parsed, BufferJSON.replacer)),
-                            updated_at: new Date().toISOString()
-                        });
-                    } catch {}
-                }
-            }
-
-            if (migrationRows.length > 0) {
-                for (let i = 0; i < migrationRows.length; i += 100) {
-                    const batch = migrationRows.slice(i, i + 100);
-                    await sb.from('whatsapp_auth_keys').upsert(batch, { onConflict: 'tenant_id,key_id' });
-                }
-                console.log(`[Supabase Auth] 🎉 Auto-migração concluída: ${migrationRows.length} chaves locais preservadas no Supabase!`);
-            }
-        } catch (migErr) {
-            console.error('[Supabase Auth] Erro na auto-migração:', migErr.message);
-        }
+    let creds = authCache.get('creds');
+    if (!creds || creds.registered === false) {
+        creds = initAuthCreds();
     }
-
-    const creds = authCache.get('creds') || initAuthCreds();
 
     const writeData = async (data, keyId) => {
         authCache.set(keyId, data);
@@ -668,17 +637,27 @@ async function connectToWhatsApp() {
     await loadLidMappingsFromDb();
     supabaseAuthState = await useSupabaseAuthState(supabase, TENANT_ID);
 
+    let waVersion = undefined;
+    try {
+        const v = await fetchLatestBaileysVersion();
+        waVersion = v.version;
+    } catch (e) {
+        console.warn('[Baileys] Não foi possível verificar versão recente:', e.message);
+    }
+
+    if (sock) {
+        try { sock.end(); } catch (e) {}
+        sock = null;
+    }
+
     sock = makeWASocket({
+        ...(waVersion ? { version: waVersion } : {}),
         auth: supabaseAuthState.state,
         logger: pino({ level: 'warn' }),
-        // 1. Identificar como Desktop obriga o WhatsApp a enviar histórico FULL
-        browser: Browsers.macOS('Desktop'),
-        // 2. Solicita sincronização completa de histórico no pareamento
+        browser: Browsers.ubuntu('Chrome'),
         syncFullHistory: true,
-        // 3. Aceita processar todos os pacotes de histórico (RECENT, FULL, ON_DEMAND)
         shouldSyncHistoryMessage: () => true,
         markOnlineOnConnect: false,
-        // 4. Obrigatório para Baileys decodificar mensagens antigas e responder Retry Receipts
         getMessage: async (key) => {
             const { data } = await supabase
                 .from('whatsapp_messages')
@@ -720,16 +699,17 @@ async function connectToWhatsApp() {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+            const isUnregistered = !supabaseAuthState?.state?.creds?.registered;
+
+            console.log(`[WhatsApp Disconnect] Código: ${statusCode}, isLoggedOut: ${isLoggedOut}, isUnregistered: ${isUnregistered}, Erro:`, lastDisconnect?.error?.message);
+
             connectionStatus = 'disconnected';
             phoneNumber = null;
 
-            if (shouldReconnect) {
-                console.log('WhatsApp desconectado temporariamente. Reconectando...');
-                connectToWhatsApp();
-            } else {
-                console.log('WhatsApp desconectado por LOGOUT. Limpando chaves de autenticação...');
-                // CRÍTICO: Limpa apenas as chaves da sessão desconectada. NUNCA apaga mensagens ou chats!
+            if (isLoggedOut || isUnregistered || statusCode === 428 || statusCode === 403 || statusCode === 500) {
+                console.log('Sessão precisa ser reinicializada para novo pareamento. Limpando credenciais...');
                 if (supabaseAuthState) {
                     await supabaseAuthState.clearSession();
                 }
@@ -737,8 +717,19 @@ async function connectToWhatsApp() {
                 if (fs.existsSync(localAuthDir)) {
                     fs.rmSync(localAuthDir, { recursive: true, force: true });
                 }
-                sock = null;
-                setTimeout(() => connectToWhatsApp(), 2000);
+                if (sock) {
+                    try { sock.end(); } catch (e) {}
+                    sock = null;
+                }
+                currentQrCode = null;
+                setTimeout(() => connectToWhatsApp(), 3000);
+            } else {
+                console.log('WhatsApp desconectado temporariamente. Reconectando em 5 segundos...');
+                if (sock) {
+                    try { sock.end(); } catch (e) {}
+                    sock = null;
+                }
+                setTimeout(() => connectToWhatsApp(), 5000);
             }
         } else if (connection === 'open') {
             console.log('WhatsApp conectado com sucesso via Supabase Auth!');
@@ -1281,6 +1272,9 @@ app.post('/api/whatsapp/connect', async (req, res) => {
         }
         currentQrCode = null;
         connectionStatus = 'connecting';
+        if (supabaseAuthState && !supabaseAuthState.state?.creds?.registered) {
+            await supabaseAuthState.clearSession();
+        }
         await connectToWhatsApp();
         res.json({ success: true, message: 'Novo socket Baileys inicializado.' });
     } catch (err) {

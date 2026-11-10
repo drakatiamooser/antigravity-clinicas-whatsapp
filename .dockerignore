@@ -1,0 +1,9 @@
+node_modules
+auth_info_baileys
+.env
+.env.local
+*.backup
+*.dump.json
+chats_store.json
+out.json
+test*.js
