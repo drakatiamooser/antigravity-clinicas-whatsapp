@@ -128,10 +128,7 @@ async function useSupabaseAuthState(sb, tenantId) {
         console.error('[Supabase Auth] Exceção ao carregar auth keys:', err);
     }
 
-    let creds = authCache.get('creds');
-    if (!creds || creds.registered === false) {
-        creds = initAuthCreds();
-    }
+    const creds = authCache.get('creds') || initAuthCreds();
 
     const writeData = async (data, keyId) => {
         authCache.set(keyId, data);
@@ -751,15 +748,24 @@ async function connectToWhatsApp() {
                     }
                     scheduleReconnect(3000);
                 } else {
-                    // Desconexão temporária (timeout de rede, renovação de QR ou 515 restartRequired):
-                    // MANTÉM o QR Code atual na memória se ele já existir!
-                    if (currentQrCode) {
-                        connectionStatus = 'qrcode';
+                    // Desconexão temporária:
+                    // Se o código for 515 (Stream Errored: restart required pós-scan do QR):
+                    // o WhatsApp já aceitou o QR e está reiniciando para autenticar.
+                    if (statusCode === 515 || statusCode === DisconnectReason.restartRequired) {
+                        console.log('🎉 Leitura do QR Code detectada! Reiniciando socket para autenticar...');
+                        currentQrCode = null;
+                        connectionStatus = 'connecting';
+                        scheduleReconnect(1500);
                     } else {
-                        connectionStatus = 'disconnected';
+                        // Se for renovação periódica de QR ou timeout (408):
+                        if (currentQrCode) {
+                            connectionStatus = 'qrcode';
+                        } else {
+                            connectionStatus = 'disconnected';
+                        }
+                        console.log('WhatsApp desconectado temporariamente. Reconectando em 3s mantendo QR Code ativo...');
+                        scheduleReconnect(3000);
                     }
-                    console.log('WhatsApp desconectado temporariamente. Reconectando em 3s mantendo QR Code ativo...');
-                    scheduleReconnect(3000);
                 }
             } else if (connection === 'open') {
                 console.log('WhatsApp conectado com sucesso via Supabase Auth!');
