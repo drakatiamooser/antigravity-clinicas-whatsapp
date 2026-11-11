@@ -725,7 +725,7 @@ async function connectToWhatsApp() {
             ...(waVersion ? { version: waVersion } : {}),
             auth: supabaseAuthState.state,
             logger: pino({ level: 'warn' }),
-            browser: Browsers.ubuntu('Chrome'),
+            browser: Browsers.macOS('Desktop'),
             syncFullHistory: true,
             shouldSyncHistoryMessage: () => true,
             markOnlineOnConnect: false,
@@ -769,6 +769,12 @@ async function connectToWhatsApp() {
                 console.log('QR CODE GERADO PARA WHATSAPP');
                 currentQrCode = await QRCode.toDataURL(qr);
                 connectionStatus = 'qrcode';
+                supabase.from('whatsapp_sessions').upsert({
+                    tenant_id: TENANT_ID,
+                    status: 'qrcode',
+                    last_qr_code: currentQrCode,
+                    updated_at: new Date().toISOString()
+                }, { onConflict: 'tenant_id' }).then(() => {});
             }
 
             if (connection === 'close') {
@@ -782,6 +788,13 @@ async function connectToWhatsApp() {
                     connectionStatus = 'disconnected';
                     phoneNumber = null;
                     currentQrCode = null;
+                    supabase.from('whatsapp_sessions').upsert({
+                        tenant_id: TENANT_ID,
+                        status: 'disconnected',
+                        last_qr_code: null,
+                        connected_phone: null,
+                        updated_at: new Date().toISOString()
+                    }, { onConflict: 'tenant_id' }).then(() => {});
                     if (supabaseAuthState) {
                         await supabaseAuthState.clearSession();
                     }
@@ -820,6 +833,7 @@ async function connectToWhatsApp() {
                 supabase.from('whatsapp_sessions').upsert({
                     tenant_id: TENANT_ID,
                     status: 'connected',
+                    last_qr_code: null,
                     connected_phone: phoneNumber,
                     updated_at: new Date().toISOString()
                 }, { onConflict: 'tenant_id' }).then(() => {});
@@ -1332,6 +1346,13 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
     connectionStatus = 'disconnected';
     currentQrCode = null;
     phoneNumber = null;
+    supabase.from('whatsapp_sessions').upsert({
+        tenant_id: TENANT_ID,
+        status: 'disconnected',
+        last_qr_code: null,
+        connected_phone: null,
+        updated_at: new Date().toISOString()
+    }, { onConflict: 'tenant_id' }).then(() => {});
     if (supabaseAuthState) await supabaseAuthState.clearSession();
     scheduleReconnect(2000);
     res.json({ success: true, message: 'Sessão desconectada e reiniciando limpa.' });
