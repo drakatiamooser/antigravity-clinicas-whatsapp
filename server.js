@@ -725,7 +725,7 @@ async function connectToWhatsApp() {
             ...(waVersion ? { version: waVersion } : {}),
             auth: supabaseAuthState.state,
             logger: pino({ level: 'warn' }),
-            browser: Browsers.macOS('Desktop'),
+            browser: Browsers.ubuntu('Chrome'),
             syncFullHistory: true,
             shouldSyncHistoryMessage: () => true,
             markOnlineOnConnect: false,
