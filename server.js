@@ -66,6 +66,16 @@ let currentQrCode = null;
 let connectionStatus = 'disconnected';
 let phoneNumber = null;
 let supabaseAuthState = null;
+let isConnecting = false;
+let reconnectTimer = null;
+
+function scheduleReconnect(delayMs = 3000) {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectToWhatsApp();
+    }, delayMs);
+}
 
 const profilePicsMap = new Map();
 const groupsMetadataMap = new Map();
@@ -634,118 +644,138 @@ async function processMessage(msg) {
 
 // === 5. CONEXÃO BAILEYS V7 COM SUPABASE AUTH ===
 async function connectToWhatsApp() {
-    await loadLidMappingsFromDb();
-    supabaseAuthState = await useSupabaseAuthState(supabase, TENANT_ID);
+    if (isConnecting) {
+        console.log('[WhatsApp] Conexão já em andamento. Aguardando...');
+        return;
+    }
+    isConnecting = true;
 
-    let waVersion = undefined;
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
     try {
-        const v = await fetchLatestBaileysVersion();
-        waVersion = v.version;
-    } catch (e) {
-        console.warn('[Baileys] Não foi possível verificar versão recente:', e.message);
-    }
+        await loadLidMappingsFromDb();
+        supabaseAuthState = await useSupabaseAuthState(supabase, TENANT_ID);
 
-    if (sock) {
-        try { sock.end(); } catch (e) {}
-        sock = null;
-    }
-
-    sock = makeWASocket({
-        ...(waVersion ? { version: waVersion } : {}),
-        auth: supabaseAuthState.state,
-        logger: pino({ level: 'warn' }),
-        browser: Browsers.ubuntu('Chrome'),
-        syncFullHistory: true,
-        shouldSyncHistoryMessage: () => true,
-        markOnlineOnConnect: false,
-        getMessage: async (key) => {
-            const { data } = await supabase
-                .from('whatsapp_messages')
-                .select('raw_message')
-                .eq('tenant_id', TENANT_ID)
-                .eq('message_id', key.id)
-                .maybeSingle();
-            return data?.raw_message || undefined;
-        }
-    });
-
-    sock.ev.on('creds.update', supabaseAuthState.saveCreds);
-
-    // Escuta novos mapeamentos @lid <-> @s.whatsapp.net descobertos nativamente no Baileys v7
-    sock.ev.on('lid-mapping.update', async (mappings) => {
+        let waVersion = undefined;
         try {
-            if (!mappings) return;
-            if (Array.isArray(mappings)) {
-                for (const item of mappings) {
-                    if (item.lid && item.pn) registerLidMapping(item.lid, item.pn);
-                }
-            } else if (typeof mappings === 'object') {
-                for (const [lid, pn] of Object.entries(mappings)) {
-                    registerLidMapping(lid, pn);
-                }
-            }
+            const v = await fetchLatestBaileysVersion();
+            waVersion = v.version;
         } catch (e) {
-            console.error('[LID mapping update error]:', e.message);
-        }
-    });
-
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            console.log('QR CODE GERADO PARA WHATSAPP');
-            currentQrCode = await QRCode.toDataURL(qr);
-            connectionStatus = 'qrcode';
+            console.warn('[Baileys] Não foi possível verificar versão recente:', e.message);
         }
 
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-            const isUnregistered = !supabaseAuthState?.state?.creds?.registered;
+        // Antes de criar novo socket, desativa completamente ouvintes do anterior
+        // Isso impede que sock.end() dispare o evento 'close' em cascata!
+        if (sock) {
+            try {
+                sock.ev.removeAllListeners('connection.update');
+                sock.ev.removeAllListeners('creds.update');
+                sock.ev.removeAllListeners('lid-mapping.update');
+                sock.ev.removeAllListeners('messages.upsert');
+                sock.ev.removeAllListeners('contacts.upsert');
+                sock.end();
+            } catch (e) {}
+            sock = null;
+        }
 
-            console.log(`[WhatsApp Disconnect] Código: ${statusCode}, isLoggedOut: ${isLoggedOut}, isUnregistered: ${isUnregistered}, Erro:`, lastDisconnect?.error?.message);
-
-            connectionStatus = 'disconnected';
-            phoneNumber = null;
-
-            if (isLoggedOut || isUnregistered || statusCode === 428 || statusCode === 403 || statusCode === 500) {
-                console.log('Sessão precisa ser reinicializada para novo pareamento. Limpando credenciais...');
-                if (supabaseAuthState) {
-                    await supabaseAuthState.clearSession();
-                }
-                const localAuthDir = path.join(__dirname, 'auth_info_baileys');
-                if (fs.existsSync(localAuthDir)) {
-                    fs.rmSync(localAuthDir, { recursive: true, force: true });
-                }
-                if (sock) {
-                    try { sock.end(); } catch (e) {}
-                    sock = null;
-                }
-                currentQrCode = null;
-                setTimeout(() => connectToWhatsApp(), 3000);
-            } else {
-                console.log('WhatsApp desconectado temporariamente. Reconectando em 5 segundos...');
-                if (sock) {
-                    try { sock.end(); } catch (e) {}
-                    sock = null;
-                }
-                setTimeout(() => connectToWhatsApp(), 5000);
+        sock = makeWASocket({
+            ...(waVersion ? { version: waVersion } : {}),
+            auth: supabaseAuthState.state,
+            logger: pino({ level: 'warn' }),
+            browser: Browsers.ubuntu('Chrome'),
+            syncFullHistory: true,
+            shouldSyncHistoryMessage: () => true,
+            markOnlineOnConnect: false,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            getMessage: async (key) => {
+                const { data } = await supabase
+                    .from('whatsapp_messages')
+                    .select('raw_message')
+                    .eq('tenant_id', TENANT_ID)
+                    .eq('message_id', key.id)
+                    .maybeSingle();
+                return data?.raw_message || undefined;
             }
-        } else if (connection === 'open') {
-            console.log('WhatsApp conectado com sucesso via Supabase Auth!');
-            connectionStatus = 'connected';
-            currentQrCode = null;
-            phoneNumber = sock.user.id.split(':')[0];
+        });
 
-            // Atualiza status na tabela whatsapp_sessions se ela existir
-            supabase.from('whatsapp_sessions').upsert({
-                tenant_id: TENANT_ID,
-                status: 'connected',
-                connected_phone: phoneNumber,
-                updated_at: new Date().toISOString()
-            }, { onConflict: 'tenant_id' }).then(() => {});
-        }
-    });
+        sock.ev.on('creds.update', supabaseAuthState.saveCreds);
+
+        // Escuta novos mapeamentos @lid <-> @s.whatsapp.net descobertos nativamente no Baileys v7
+        sock.ev.on('lid-mapping.update', async (mappings) => {
+            try {
+                if (!mappings) return;
+                if (Array.isArray(mappings)) {
+                    for (const item of mappings) {
+                        if (item.lid && item.pn) registerLidMapping(item.lid, item.pn);
+                    }
+                } else if (typeof mappings === 'object') {
+                    for (const [lid, pn] of Object.entries(mappings)) {
+                        registerLidMapping(lid, pn);
+                    }
+                }
+            } catch (e) {
+                console.error('[LID mapping update error]:', e.message);
+            }
+        });
+
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
+            if (qr) {
+                console.log('QR CODE GERADO PARA WHATSAPP');
+                currentQrCode = await QRCode.toDataURL(qr);
+                connectionStatus = 'qrcode';
+            }
+
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+
+                console.log(`[WhatsApp Disconnect] Código: ${statusCode}, isLoggedOut: ${isLoggedOut}, Erro:`, lastDisconnect?.error?.message);
+
+                if (isLoggedOut) {
+                    console.log('WhatsApp desconectado por LOGOUT no aparelho. Limpando credenciais...');
+                    connectionStatus = 'disconnected';
+                    phoneNumber = null;
+                    currentQrCode = null;
+                    if (supabaseAuthState) {
+                        await supabaseAuthState.clearSession();
+                    }
+                    const localAuthDir = path.join(__dirname, 'auth_info_baileys');
+                    if (fs.existsSync(localAuthDir)) {
+                        fs.rmSync(localAuthDir, { recursive: true, force: true });
+                    }
+                    scheduleReconnect(3000);
+                } else {
+                    // Desconexão temporária (timeout de rede, renovação de QR ou 515 restartRequired):
+                    // MANTÉM o QR Code atual na memória se ele já existir!
+                    if (currentQrCode) {
+                        connectionStatus = 'qrcode';
+                    } else {
+                        connectionStatus = 'disconnected';
+                    }
+                    console.log('WhatsApp desconectado temporariamente. Reconectando em 3s mantendo QR Code ativo...');
+                    scheduleReconnect(3000);
+                }
+            } else if (connection === 'open') {
+                console.log('WhatsApp conectado com sucesso via Supabase Auth!');
+                connectionStatus = 'connected';
+                currentQrCode = null;
+                phoneNumber = sock.user.id.split(':')[0];
+
+                // Atualiza status na tabela whatsapp_sessions se ela existir
+                supabase.from('whatsapp_sessions').upsert({
+                    tenant_id: TENANT_ID,
+                    status: 'connected',
+                    connected_phone: phoneNumber,
+                    updated_at: new Date().toISOString()
+                }, { onConflict: 'tenant_id' }).then(() => {});
+            }
+        });
 
     // Sincronização de Contatos
     const handleContact = (c) => {
@@ -892,6 +922,9 @@ async function connectToWhatsApp() {
             updateMessageStatus(key.id, key.remoteJid, s);
         }
     });
+    } finally {
+        isConnecting = false;
+    }
 }
 
 // Inicializa conexão
@@ -1236,14 +1269,23 @@ app.get('/api/whatsapp/contact-info', async (req, res) => {
 });
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
-    if (sock) {
-        sock.logout();
-        res.json({ success: true, message: 'Desconectando sessão...' });
-    } else {
-        if (supabaseAuthState) await supabaseAuthState.clearSession();
-        connectToWhatsApp();
-        res.json({ success: true, message: 'Sessão limpa e reiniciando.' });
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
     }
+    if (sock) {
+        try {
+            sock.ev.removeAllListeners('connection.update');
+            sock.logout();
+        } catch (e) {}
+        sock = null;
+    }
+    connectionStatus = 'disconnected';
+    currentQrCode = null;
+    phoneNumber = null;
+    if (supabaseAuthState) await supabaseAuthState.clearSession();
+    scheduleReconnect(2000);
+    res.json({ success: true, message: 'Sessão desconectada e reiniciando limpa.' });
 });
 
 app.post('/api/whatsapp/connect', async (req, res) => {
@@ -1257,7 +1299,8 @@ app.post('/api/whatsapp/connect', async (req, res) => {
             });
         }
         
-        if (currentQrCode && connectionStatus === 'qrcode') {
+        if (currentQrCode) {
+            connectionStatus = 'qrcode';
             return res.json({ 
                 success: true, 
                 message: 'QR Code ativo pronto para leitura.', 
@@ -1266,17 +1309,18 @@ app.post('/api/whatsapp/connect', async (req, res) => {
             });
         }
 
-        if (sock) {
-            try { sock.end(); } catch (e) {}
-            sock = null;
+        if (isConnecting) {
+            return res.json({
+                success: true,
+                message: 'Conexão já em inicialização.',
+                status: connectionStatus,
+                qr: currentQrCode
+            });
         }
-        currentQrCode = null;
+
         connectionStatus = 'connecting';
-        if (supabaseAuthState && !supabaseAuthState.state?.creds?.registered) {
-            await supabaseAuthState.clearSession();
-        }
         await connectToWhatsApp();
-        res.json({ success: true, message: 'Novo socket Baileys inicializado.' });
+        res.json({ success: true, message: 'Novo socket Baileys inicializado.', status: connectionStatus, qr: currentQrCode });
     } catch (err) {
         console.error('[Connect API Error]:', err);
         res.status(500).json({ error: err.message });
