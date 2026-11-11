@@ -193,19 +193,62 @@ async function useSupabaseAuthState(sb, tenantId) {
                     return result;
                 },
                 set: async (data) => {
-                    const tasks = [];
+                    const upsertRows = [];
+                    const deleteKeyIds = [];
+
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
                             const keyId = `${category}-${id}`;
                             if (value) {
-                                tasks.push(writeData(value, keyId));
+                                authCache.set(keyId, value);
+                                const serialized = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
+                                upsertRows.push({
+                                    tenant_id: tenantId,
+                                    key_id: keyId,
+                                    key_data: serialized,
+                                    updated_at: new Date().toISOString()
+                                });
                             } else {
-                                tasks.push(removeData(keyId));
+                                authCache.delete(keyId);
+                                deleteKeyIds.push(keyId);
                             }
                         }
                     }
-                    await Promise.all(tasks);
+
+                    // 1. Grava em lotes de 100 rows no Supabase de forma segura e sequencial
+                    // (Evita disparar centenas de fetch concorrentes que travam a conexão HTTP)
+                    if (upsertRows.length > 0) {
+                        for (let i = 0; i < upsertRows.length; i += 100) {
+                            const batch = upsertRows.slice(i, i + 100);
+                            try {
+                                const { error } = await sb
+                                    .from('whatsapp_auth_keys')
+                                    .upsert(batch, { onConflict: 'tenant_id,key_id' });
+                                if (error) {
+                                    console.error('[Supabase Auth] Erro no batch upsert:', error.message);
+                                }
+                            } catch (e) {
+                                console.error('[Supabase Auth] Exceção no batch upsert:', e.message);
+                            }
+                        }
+                    }
+
+                    // 2. Remove chaves excluídas em lote
+                    if (deleteKeyIds.length > 0) {
+                        try {
+                            const { error } = await sb
+                                .from('whatsapp_auth_keys')
+                                .delete()
+                                .eq('tenant_id', tenantId)
+                                .in('key_id', deleteKeyIds);
+                            if (error) {
+                                console.error('[Supabase Auth] Erro no batch delete:', error.message);
+                            }
+                        } catch (e) {
+                            console.error('[Supabase Auth] Exceção no batch delete:', e.message);
+                        }
+                    }
                 }
             }
         },
