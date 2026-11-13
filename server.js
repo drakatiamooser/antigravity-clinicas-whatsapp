@@ -880,6 +880,27 @@ async function connectToWhatsApp() {
             if (phone) pushNamesMap.set(phone, pushName);
             if (c.lid) pushNamesMap.set(c.lid.replace(/:.*@/, '@'), pushName);
         }
+
+        // Persistência contínua no Supabase para garantir que nomes e pushNames nunca se percam após reinicialização
+        const candidateName = c.name || c.verifiedName || null;
+        if ((candidateName || pushName) && supabase) {
+            const updateFields = {};
+            const phone = cleanId.split('@')[0];
+            if (candidateName && !isInvalidName(candidateName, phone)) {
+                updateFields.name = candidateName;
+            }
+            if (pushName && !isInvalidName(pushName, phone)) {
+                updateFields.push_name = pushName;
+            }
+            if (Object.keys(updateFields).length > 0) {
+                updateFields.updated_at = new Date().toISOString();
+                supabase.from('whatsapp_chats')
+                    .update(updateFields)
+                    .eq('tenant_id', TENANT_ID)
+                    .or(`chat_jid.eq.${cleanId},phone_number.eq.${phone}`)
+                    .then(() => {});
+            }
+        }
     };
 
     sock.ev.on('contacts.upsert', (contacts) => {
@@ -1316,6 +1337,52 @@ app.get('/api/whatsapp/group-metadata', async (req, res) => {
     res.json({ id: jid, subject: 'Grupo do WhatsApp', desc: 'Grupo sincronizado.', participants: [] });
 });
 
+// Endpoint de Avatar do WhatsApp (Foto do contato ou grupo)
+app.get('/api/whatsapp/avatar', async (req, res) => {
+    const jid = req.query.jid;
+    if (!jid) return res.status(400).json({ url: null });
+
+    try {
+        if (profilePicsMap.has(jid) && profilePicsMap.get(jid)) {
+            return res.json({ url: profilePicsMap.get(jid) });
+        }
+
+        if (sock && connectionStatus === 'connected') {
+            const canJid = resolveCanonicalJid({ remoteJid: jid });
+            let url = null;
+            try {
+                url = await sock.profilePictureUrl(canJid, 'image');
+            } catch {
+                if (jid !== canJid) {
+                    try {
+                        url = await sock.profilePictureUrl(jid, 'image');
+                    } catch {}
+                }
+            }
+
+            if (url) {
+                profilePicsMap.set(jid, url);
+                profilePicsMap.set(canJid, url);
+
+                // Persistir no Supabase em background
+                if (supabase) {
+                    supabase.from('whatsapp_chats')
+                        .update({ avatar_url: url, updated_at: new Date().toISOString() })
+                        .eq('tenant_id', TENANT_ID)
+                        .or(`chat_jid.eq.${canJid},chat_jid.eq.${jid}`)
+                        .then(() => {});
+                }
+
+                return res.json({ url });
+            }
+        }
+    } catch (e) {
+        console.error('[Avatar Error]:', e.message);
+    }
+
+    res.json({ url: null });
+});
+
 // Informações de Contato
 app.get('/api/whatsapp/contact-info', async (req, res) => {
     const jid = req.query.jid;
@@ -1330,7 +1397,16 @@ app.get('/api/whatsapp/contact-info', async (req, res) => {
             status = await sock.fetchStatus(jid).catch(() => null);
             if (!profilePic) {
                 profilePic = await sock.profilePictureUrl(jid, 'image').catch(() => null);
-                if (profilePic) profilePicsMap.set(jid, profilePic);
+                if (profilePic) {
+                    profilePicsMap.set(jid, profilePic);
+                    if (supabase) {
+                        supabase.from('whatsapp_chats')
+                            .update({ avatar_url: profilePic, updated_at: new Date().toISOString() })
+                            .eq('tenant_id', TENANT_ID)
+                            .or(`chat_jid.eq.${jid},phone_number.eq.${jid.split('@')[0]}`)
+                            .then(() => {});
+                    }
+                }
             }
             businessProfile = await sock.getBusinessProfile(jid).catch(() => null);
         }
