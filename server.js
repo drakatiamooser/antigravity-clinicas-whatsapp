@@ -297,12 +297,26 @@ class BatchFlusher {
         if (finalPhone && (chat.chat_jid.endsWith('@lid') || (!chat.chat_jid.endsWith('@s.whatsapp.net') && !chat.chat_jid.endsWith('@g.us')))) {
             finalPhone = null;
         }
+        if (!finalName && finalPushName && !isInvalidName(finalPushName, finalPhone)) {
+            finalName = finalPushName;
+        }
+
+        // CRÍTICO: Nunca sobrescrever nem retroceder um timestamp real com timestamp de sincronização
+        let finalTs = prev.last_message_ts ? Number(prev.last_message_ts) : 0;
+        if (chat.last_message_ts) {
+            const incomingTs = Number(chat.last_message_ts);
+            if (!finalTs || incomingTs > finalTs) {
+                finalTs = incomingTs;
+            }
+        }
+
         this.chatsMap.set(chat.chat_jid, { 
             ...prev, 
             ...chat, 
             name: finalName,
             push_name: finalPushName,
-            phone_number: finalPhone
+            phone_number: finalPhone,
+            last_message_ts: finalTs || chat.last_message_ts || Date.now()
         });
     }
 
@@ -919,8 +933,15 @@ async function connectToWhatsApp() {
                 if (isInvalidName(name, phone)) {
                     name = type === 'group' ? (c.name || 'Grupo') : null;
                 }
+                if (!name && pushName && !isInvalidName(pushName, phone)) {
+                    name = pushName;
+                }
 
-                batchFlusher.queueChat({
+                const prevQueued = batchFlusher.chatsMap.get(canJid);
+                const trueTs = (c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : null)
+                    || (prevQueued?.last_message_ts ? Number(prevQueued.last_message_ts) : null);
+
+                const chatPayload = {
                     tenant_id: TENANT_ID,
                     chat_jid: canJid,
                     lid_jid: isLid ? canJid : (rawJid.endsWith('@lid') ? rawJid : null),
@@ -928,10 +949,13 @@ async function connectToWhatsApp() {
                     push_name: pushName,
                     phone_number: phone,
                     chat_type: type,
-                    last_message_ts: c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : Date.now(),
                     unread_count: c.unreadCount || 0,
                     updated_at: new Date().toISOString()
-                });
+                };
+                if (trueTs) {
+                    chatPayload.last_message_ts = trueTs;
+                }
+                batchFlusher.queueChat(chatPayload);
             }
         }
 
@@ -1024,7 +1048,7 @@ app.get('/api/whatsapp/chats', async (req, res) => {
             if (!error && data && data.length > 0) {
                 const list = data.map(c => ({
                     id: c.chat_jid,
-                    name: c.name || null,
+                    name: c.name || c.push_name || null,
                     pushName: c.push_name || null,
                     phoneNumber: c.phone_number || (c.chat_jid.endsWith('@s.whatsapp.net') ? c.chat_jid.split('@')[0] : null),
                     type: c.chat_type,
@@ -1045,7 +1069,7 @@ app.get('/api/whatsapp/chats', async (req, res) => {
             .slice(0, 100)
             .map(c => ({
                 id: c.chat_jid,
-                name: c.name || null,
+                name: c.name || c.push_name || null,
                 pushName: c.push_name || null,
                 phoneNumber: c.phone_number || (c.chat_jid.endsWith('@s.whatsapp.net') ? c.chat_jid.split('@')[0] : null),
                 type: c.chat_type || 'user',
