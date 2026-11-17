@@ -22,13 +22,63 @@ const pino = require('pino');
 const QRCode = require('qrcode');
 
 const app = express();
-app.use(cors());
+
+// Lista branca restrita para CORS (Clínica + Vercel + Localhost)
+const allowedOrigins = [
+    'https://katiamooser.com.br',
+    'https://www.katiamooser.com.br',
+    'https://gerenciadorclinica.vercel.app',
+    'http://localhost:3000',
+    'http://localhost:4100'
+];
+
+app.use(cors({
+    origin: function (origin, callback) {
+        if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+            return callback(null, true);
+        }
+        return callback(new Error('Origem bloqueada pela política de CORS restrita'));
+    },
+    credentials: true
+}));
+
 app.use(express.json());
 
-// Middleware de Autenticação Segura
+// Rate Limiting nativo em memória para proteção contra flood e abusos
+const rateLimitWindowMs = 60 * 1000;
+const maxRequestsPerWindow = 60;
+const ipRequestCounts = new Map();
+
+function rateLimiter(req, res, next) {
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const clientRecord = ipRequestCounts.get(ip) || { count: 0, resetTime: now + rateLimitWindowMs };
+
+    if (now > clientRecord.resetTime) {
+        clientRecord.count = 1;
+        clientRecord.resetTime = now + rateLimitWindowMs;
+    } else {
+        clientRecord.count++;
+        if (clientRecord.count > maxRequestsPerWindow) {
+            return res.status(429).json({ error: "Muitas requisições. Limite de taxa excedido (Rate Limit)." });
+        }
+    }
+    ipRequestCounts.set(ip, clientRecord);
+    next();
+}
+
+app.use('/send-message', rateLimiter);
+app.use('/api', rateLimiter);
+
+// Middleware de Autenticação Segura (sem fallback hardcoded)
 app.use('/api', (req, res, next) => {
     const authHeader = req.headers.authorization;
-    const secret = process.env.WHATSAPP_API_SECRET || process.env.API_SECRET || "antigravity-secure-wapi-7742";
+    const secret = process.env.WHATSAPP_API_SECRET || process.env.API_SECRET;
+    
+    if (!secret) {
+        console.error("❌ [FATAL]: WHATSAPP_API_SECRET ausente nas variáveis de ambiente!");
+        return res.status(500).json({ error: "Configuração do servidor incompleta. WHATSAPP_API_SECRET não definido." });
+    }
     
     if (!authHeader || authHeader !== `Bearer ${secret}`) {
         return res.status(401).json({ error: "Acesso Negado. Chave de API inválida." });
