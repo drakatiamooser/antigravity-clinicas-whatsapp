@@ -1214,6 +1214,111 @@ app.post('/api/whatsapp/fetch-older-history', async (req, res) => {
     }
 });
 
+// Marcar Conversa e Mensagens como Lidas (Comunicação com o WhatsApp Oficial)
+app.post('/api/whatsapp/mark-read', async (req, res) => {
+    try {
+        const { chatJid } = req.body;
+        if (!chatJid) {
+            return res.status(400).json({ error: 'chatJid é obrigatório.' });
+        }
+
+        const canonicalJid = await resolveCanonicalJidAsync(chatJid);
+
+        // 1. Zera contador no Supabase (whatsapp_chats)
+        await supabase
+            .from('whatsapp_chats')
+            .update({ 
+                unread_count: 0,
+                updated_at: new Date().toISOString()
+            })
+            .eq('tenant_id', TENANT_ID)
+            .or(`chat_jid.eq.${canonicalJid},chat_jid.eq.${chatJid}`);
+
+        // Zera no batchFlusher em memória se houver
+        if (batchFlusher?.chatsMap) {
+            if (batchFlusher.chatsMap.has(canonicalJid)) {
+                const c = batchFlusher.chatsMap.get(canonicalJid);
+                c.unread_count = 0;
+                batchFlusher.chatsMap.set(canonicalJid, c);
+            }
+            if (batchFlusher.chatsMap.has(chatJid)) {
+                const c = batchFlusher.chatsMap.get(chatJid);
+                c.unread_count = 0;
+                batchFlusher.chatsMap.set(chatJid, c);
+            }
+        }
+
+        // 2. Se o WhatsApp estiver conectado, envia confirmação de leitura oficial (Baileys)
+        if (sock && connectionStatus === 'connected') {
+            const { data: unreadMsgs } = await supabase
+                .from('whatsapp_messages')
+                .select('message_id, from_me, raw_key, timestamp_ms')
+                .eq('tenant_id', TENANT_ID)
+                .or(`chat_jid.eq.${canonicalJid},chat_jid.eq.${chatJid}`)
+                .eq('from_me', false)
+                .order('timestamp_ms', { ascending: false })
+                .limit(30);
+
+            if (unreadMsgs && unreadMsgs.length > 0) {
+                const keysToRead = unreadMsgs.map(m => m.raw_key || {
+                    remoteJid: chatJid,
+                    fromMe: false,
+                    id: m.message_id
+                });
+
+                // A) Envia recibo de leitura para os remetentes (double blue tick)
+                if (typeof sock.readMessages === 'function') {
+                    try {
+                        await sock.readMessages(keysToRead);
+                    } catch (readErr) {
+                        console.error('[mark-read] Erro ao chamar sock.readMessages:', readErr.message);
+                    }
+                }
+
+                // B) Modifica estado do chat para lido no WhatsApp (sincroniza com celular e WhatsApp Web)
+                if (typeof sock.chatModify === 'function') {
+                    try {
+                        await sock.chatModify({ 
+                            markRead: true,
+                            lastMessages: unreadMsgs.map(m => ({
+                                key: m.raw_key || { remoteJid: chatJid, fromMe: false, id: m.message_id },
+                                messageTimestamp: Math.floor(Number(m.timestamp_ms || Date.now()) / 1000)
+                            }))
+                        }, chatJid);
+                    } catch {
+                        try {
+                            await sock.chatModify({ markRead: true }, chatJid);
+                        } catch (cmErr) {
+                            console.error('[mark-read] Erro em sock.chatModify:', cmErr.message);
+                        }
+                    }
+                }
+
+                // Atualiza status local para 'READ' nas mensagens no banco
+                const msgIds = unreadMsgs.map(m => m.message_id);
+                await supabase
+                    .from('whatsapp_messages')
+                    .update({ status: 'READ' })
+                    .eq('tenant_id', TENANT_ID)
+                    .in('message_id', msgIds);
+            } else {
+                if (typeof sock.chatModify === 'function') {
+                    try {
+                        await sock.chatModify({ markRead: true }, chatJid);
+                    } catch (e) {
+                        console.error('[mark-read] Erro fallback chatModify:', e.message);
+                    }
+                }
+            }
+        }
+
+        return res.json({ success: true, chatJid: canonicalJid, unreadCount: 0 });
+    } catch (e) {
+        console.error('Erro em mark-read:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // Envio de Mensagens
 app.post('/api/whatsapp/send-message', async (req, res) => {
     try {
